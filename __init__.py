@@ -1,13 +1,18 @@
 import json
 import os
+import re
+import urllib.request
+import urllib.error
 
 from aqt import gui_hooks, mw
 from aqt.editor import Editor
 from aqt.qt import (
     QAction,
+    QByteArray,
     QCheckBox,
     QDialog,
     QDialogButtonBox,
+    QMimeData,
     QVBoxLayout,
 )
 
@@ -21,7 +26,8 @@ CURRENT_CONFIG_VERSION = "0.1"
 DEFAULT_SETTINGS = {
     "version": CURRENT_CONFIG_VERSION,
     "remove_spaces": False,
-    "paste_as_plain_text": True,
+    "paste_as_plain_text": False,
+    "paste_media_links": True,
 }
 
 CONFIG_FILENAME = "clipboard_settings.json"
@@ -65,10 +71,6 @@ def load_settings():
 
     path = get_settings_path()
 
-    # --------------------------------------------------------
-    # Create default settings if the file doesn't exist.
-    # --------------------------------------------------------
-
     if not os.path.exists(path):
 
         settings = DEFAULT_SETTINGS.copy()
@@ -76,10 +78,6 @@ def load_settings():
         save_settings(settings)
 
         return settings
-
-    # --------------------------------------------------------
-    # Read existing settings.
-    # --------------------------------------------------------
 
     try:
 
@@ -104,10 +102,6 @@ def load_settings():
 
         return settings
 
-    # --------------------------------------------------------
-    # Validate settings.
-    # --------------------------------------------------------
-
     if not isinstance(settings, dict):
 
         settings = DEFAULT_SETTINGS.copy()
@@ -116,14 +110,27 @@ def load_settings():
 
         return settings
 
-    # --------------------------------------------------------
-    # Make sure required settings exist.
-    # --------------------------------------------------------
-
     changed = False
 
     if "version" not in settings:
         settings["version"] = CURRENT_CONFIG_VERSION
+        changed = True
+
+    # --------------------------------------------------------
+    # Migrate old "enabled" setting to "remove_spaces".
+    # --------------------------------------------------------
+
+    if (
+        "remove_spaces" not in settings
+        and "enabled" in settings
+    ):
+
+        settings["remove_spaces"] = bool(
+            settings["enabled"]
+        )
+
+        del settings["enabled"]
+
         changed = True
 
     if "remove_spaces" not in settings:
@@ -132,6 +139,10 @@ def load_settings():
 
     if "paste_as_plain_text" not in settings:
         settings["paste_as_plain_text"] = False
+        changed = True
+
+    if "paste_media_links" not in settings:
+        settings["paste_media_links"] = False
         changed = True
 
     if settings["version"] != CURRENT_CONFIG_VERSION:
@@ -154,6 +165,12 @@ def save_settings(settings):
     path = get_settings_path()
 
     settings["version"] = CURRENT_CONFIG_VERSION
+
+    # Never save the old setting name.
+    settings.pop(
+        "enabled",
+        None,
+    )
 
     try:
 
@@ -178,7 +195,7 @@ def save_settings(settings):
 
 
 # ============================================================
-# Load configuration at startup
+# Load configuration
 # ============================================================
 
 settings = load_settings()
@@ -197,6 +214,13 @@ paste_as_plain_text = bool(
     )
 )
 
+paste_media_links = bool(
+    settings.get(
+        "paste_media_links",
+        False,
+    )
+)
+
 
 # ============================================================
 # Editor tracking
@@ -206,13 +230,344 @@ editors = []
 
 
 # ============================================================
+# Media URL detection
+# ============================================================
+
+IMAGE_EXTENSIONS = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".webp",
+    ".bmp",
+    ".svg",
+    ".avif",
+}
+
+AUDIO_EXTENSIONS = {
+    ".mp3",
+    ".wav",
+    ".ogg",
+    ".oga",
+    ".opus",
+    ".m4a",
+    ".aac",
+    ".flac",
+    ".weba",
+}
+
+
+def get_media_type_from_url(url):
+    """
+    Determine whether a URL appears to point to an image
+    or audio file.
+
+    Returns:
+
+        "image"
+        "audio"
+        None
+    """
+
+    # Remove query string and fragment.
+    clean_url = url.split("?", 1)[0]
+    clean_url = clean_url.split("#", 1)[0]
+
+    clean_url = clean_url.lower()
+
+    for extension in IMAGE_EXTENSIONS:
+
+        if clean_url.endswith(extension):
+            return "image"
+
+    for extension in AUDIO_EXTENSIONS:
+
+        if clean_url.endswith(extension):
+            return "audio"
+
+    return None
+
+
+def extract_media_url(text):
+    """
+    Extract a single HTTP/HTTPS media URL from clipboard text.
+
+    Only a single URL is accepted. This prevents accidentally
+    converting arbitrary text containing a URL.
+    """
+
+    if not text:
+        return None
+
+    text = text.strip()
+
+    # Must be exactly one URL.
+    match = re.fullmatch(
+        r"https?://\S+",
+        text,
+        re.IGNORECASE,
+    )
+
+    if not match:
+        return None
+
+    url = match.group(0)
+
+    # Remove common punctuation accidentally copied after
+    # the URL.
+    url = url.rstrip(
+        ".,;:!?)]}>\"'"
+    )
+
+    if get_media_type_from_url(url) is None:
+        return None
+
+    return url
+
+
+# ============================================================
+# Download media from URL
+# ============================================================
+
+def download_media(url):
+    """
+    Download media from a URL.
+
+    Returns:
+
+        (data, content_type)
+
+    or:
+
+        (None, None)
+    """
+
+    try:
+
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 "
+                    "(Anki Clipboard Controls)"
+                )
+            },
+        )
+
+        with urllib.request.urlopen(
+            request,
+            timeout=15,
+        ) as response:
+
+            data = response.read()
+
+            content_type = response.headers.get(
+                "Content-Type",
+                "",
+            )
+
+        return data, content_type
+
+    except (
+        urllib.error.URLError,
+        urllib.error.HTTPError,
+        TimeoutError,
+        OSError,
+    ) as error:
+
+        print(
+            "Clipboard Controls: "
+            f"Could not download media URL: "
+            f"{url} ({error})"
+        )
+
+        return None, None
+
+    except Exception as error:
+
+        print(
+            "Clipboard Controls: "
+            f"Unexpected download error: "
+            f"{url} ({error})"
+        )
+
+        return None, None
+
+
+# ============================================================
+# URL -> MIME data
+# ============================================================
+
+def convert_media_url_to_mime(mime):
+    """
+    If the clipboard contains a direct image/audio URL,
+    download it and replace the clipboard data with the
+    corresponding binary media.
+
+    This allows Anki to process it like normal pasted media.
+    """
+
+    if not paste_media_links:
+        return mime
+
+    if not mime.hasText():
+        return mime
+
+    text = mime.text()
+
+    url = extract_media_url(text)
+
+    if not url:
+        return mime
+
+    media_type = get_media_type_from_url(url)
+
+    if media_type not in (
+        "image",
+        "audio",
+    ):
+        return mime
+
+    print(
+        "Clipboard Controls: "
+        f"Downloading {media_type}: {url}"
+    )
+
+    data, content_type = download_media(url)
+
+    if not data:
+        return mime
+
+    # --------------------------------------------------------
+    # Create a new MIME object.
+    # --------------------------------------------------------
+
+    new_mime = QMimeData()
+
+    # Keep the original URL as text as a fallback.
+    new_mime.setText(text)
+
+
+    # --------------------------------------------------------
+    # Image.
+    # --------------------------------------------------------
+
+    if media_type == "image":
+
+        # Qt accepts image bytes through imageData.
+        new_mime.setData(
+            content_type
+            if content_type.startswith("image/")
+            else "image/png",
+            QByteArray(data),
+        )
+
+        return new_mime
+
+
+    # --------------------------------------------------------
+    # Audio.
+    # --------------------------------------------------------
+
+    if media_type == "audio":
+
+        if (
+            not content_type
+            or not content_type.startswith("audio/")
+        ):
+
+            extension = (
+                url
+                .split("?", 1)[0]
+                .split("#", 1)[0]
+                .lower()
+            )
+
+            if extension.endswith(".mp3"):
+                content_type = "audio/mpeg"
+
+            elif extension.endswith(".wav"):
+                content_type = "audio/wav"
+
+            elif extension.endswith(".ogg"):
+                content_type = "audio/ogg"
+
+            elif extension.endswith(".oga"):
+                content_type = "audio/ogg"
+
+            elif extension.endswith(".opus"):
+                content_type = "audio/opus"
+
+            elif extension.endswith(".m4a"):
+                content_type = "audio/mp4"
+
+            elif extension.endswith(".aac"):
+                content_type = "audio/aac"
+
+            elif extension.endswith(".flac"):
+                content_type = "audio/flac"
+
+            elif extension.endswith(".weba"):
+                content_type = "audio/webm"
+
+            else:
+                content_type = "application/octet-stream"
+
+
+        new_mime.setData(
+            content_type,
+            QByteArray(data),
+        )
+
+        return new_mime
+
+
+    return mime
+
+
+# ============================================================
+# Anki MIME hook
+# ============================================================
+
+def editor_will_process_mime(
+    mime,
+    editor_web_view,
+    internal,
+    extended,
+    drop_event,
+):
+    """
+    Convert direct image/audio URLs into media before Anki
+    processes the paste.
+    """
+
+    if internal:
+        return mime
+
+    if drop_event:
+        return mime
+
+    return convert_media_url_to_mime(
+        mime
+    )
+
+
+gui_hooks.editor_will_process_mime.append(
+    editor_will_process_mime
+)
+
+
+# ============================================================
 # JavaScript paste handler
 # ============================================================
 
 PASTE_HANDLER = r"""
 (function() {
 
+    // --------------------------------------------------------
     // Remove an existing handler first.
+    // --------------------------------------------------------
+
     if (
         window.removeSpacesPasteInstalled &&
         window.removeSpacesPasteHandler
@@ -225,88 +580,242 @@ PASTE_HANDLER = r"""
     }
 
 
-    window.removeSpacesPasteHandler = function(event) {
+    // --------------------------------------------------------
+    // Detect native media.
+    // --------------------------------------------------------
 
-        const removeSpaces =
-            window.removeSpacesPasteEnabled === true;
+    function clipboardContainsNativeMedia(clipboard) {
 
-        const pasteAsPlainText =
-            window.pasteAsPlainTextEnabled === true;
+        if (clipboard.types) {
+
+            for (
+                let i = 0;
+                i < clipboard.types.length;
+                i++
+            ) {
+
+                const type =
+                    clipboard.types[i].toLowerCase();
 
 
-        // If both options are disabled, let Anki
-        // perform its normal paste.
+                if (
+                    type.startsWith("image/")
+                ) {
+                    return true;
+                }
+
+
+                if (
+                    type.startsWith("audio/")
+                ) {
+                    return true;
+                }
+
+
+                if (
+                    type.startsWith("video/")
+                ) {
+                    return true;
+                }
+            }
+        }
+
+
+        if (clipboard.items) {
+
+            for (
+                let i = 0;
+                i < clipboard.items.length;
+                i++
+            ) {
+
+                const item =
+                    clipboard.items[i];
+
+
+                if (
+                    item.kind === "file" &&
+                    item.type
+                ) {
+
+                    const type =
+                        item.type.toLowerCase();
+
+
+                    if (
+                        type.startsWith("image/") ||
+                        type.startsWith("audio/") ||
+                        type.startsWith("video/")
+                    ) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+
+        return false;
+    }
+
+
+    // --------------------------------------------------------
+    // Detect a direct media URL.
+    //
+    // These must be allowed through so Anki's Python
+    // editor_will_process_mime hook can download them.
+    // --------------------------------------------------------
+
+    function looksLikeMediaURL(text) {
+
+        if (!text) {
+            return false;
+        }
+
+        text = text.trim();
+
+
         if (
-            !removeSpaces &&
-            !pasteAsPlainText
+            !/^https?:\/\/\S+$/i.test(text)
         ) {
-            return;
+            return false;
         }
 
 
-        if (!event.clipboardData) {
-            return;
-        }
+        text = text
+            .replace(/[.,;:!?)]}>\"']+$/, "")
+            .toLowerCase();
 
 
-        // Always obtain the plain-text version.
-        //
-        // This removes HTML formatting such as:
-        //
-        // - fonts
-        // - colors
-        // - bold
-        // - italic
-        // - underline
-        // - links
-        // - tables
-        // - images
-        // - other HTML formatting
-        //
-
-        let text =
-            event.clipboardData.getData("text/plain");
-
-
-        if (
-            text === null ||
-            text === undefined
-        ) {
-            return;
-        }
-
-
-        // ----------------------------------------------------
-        // Remove whitespace if enabled.
-        // ----------------------------------------------------
-
-        if (removeSpaces) {
-            text = text.replace(/\s/g, "");
-        }
-
-
-        // ----------------------------------------------------
-        // Stop Anki's normal rich-text paste.
-        // ----------------------------------------------------
-
-        event.preventDefault();
-        event.stopPropagation();
-        event.stopImmediatePropagation();
-
-
-        // ----------------------------------------------------
-        // Insert plain text.
-        // ----------------------------------------------------
-
-        document.execCommand(
-            "insertText",
-            false,
-            text
+        return (
+            /\.(jpg|jpeg|png|gif|webp|bmp|svg|avif)(\?|#|$)/i.test(text) ||
+            /\.(mp3|wav|ogg|oga|opus|m4a|aac|flac|weba)(\?|#|$)/i.test(text)
         );
-    };
+    }
 
 
-    // Install the paste handler.
+    // --------------------------------------------------------
+    // Paste handler.
+    // --------------------------------------------------------
+
+    window.removeSpacesPasteHandler =
+        function(event) {
+
+            const removeSpaces =
+                window.removeSpacesPasteEnabled === true;
+
+            const pasteAsPlainText =
+                window.pasteAsPlainTextEnabled === true;
+
+            const pasteMediaLinks =
+                window.pasteMediaLinksEnabled === true;
+
+
+            // Nothing enabled.
+            if (
+                !removeSpaces &&
+                !pasteAsPlainText &&
+                !pasteMediaLinks
+            ) {
+                return;
+            }
+
+
+            const clipboard =
+                event.clipboardData;
+
+
+            if (!clipboard) {
+                return;
+            }
+
+
+            // ------------------------------------------------
+            // Let Anki handle actual images/audio/video.
+            // ------------------------------------------------
+
+            if (
+                clipboardContainsNativeMedia(
+                    clipboard
+                )
+            ) {
+                return;
+            }
+
+
+            // ------------------------------------------------
+            // If this is a media URL and media-link pasting
+            // is enabled, allow Anki's Python MIME hook to
+            // process it.
+            // ------------------------------------------------
+
+            if (
+                pasteMediaLinks &&
+                looksLikeMediaURL(
+                    clipboard.getData("text/plain")
+                )
+            ) {
+                return;
+            }
+
+
+            // ------------------------------------------------
+            // Get plain text.
+            // ------------------------------------------------
+
+            let text =
+                clipboard.getData(
+                    "text/plain"
+                );
+
+
+            if (
+                text === null ||
+                text === undefined
+            ) {
+                return;
+            }
+
+
+            // ------------------------------------------------
+            // Remove whitespace.
+            // ------------------------------------------------
+
+            if (removeSpaces) {
+
+                text = text.replace(
+                    /\s/g,
+                    ""
+                );
+            }
+
+
+            // ------------------------------------------------
+            // Intercept text/HTML paste.
+            // ------------------------------------------------
+
+            event.preventDefault();
+
+            event.stopPropagation();
+
+            event.stopImmediatePropagation();
+
+
+            // ------------------------------------------------
+            // Insert plain text.
+            // ------------------------------------------------
+
+            document.execCommand(
+                "insertText",
+                false,
+                text
+            );
+        };
+
+
+    // --------------------------------------------------------
+    // Install handler.
+    // --------------------------------------------------------
+
     document.addEventListener(
         "paste",
         window.removeSpacesPasteHandler,
@@ -352,6 +861,12 @@ def update_editor(editor: Editor):
         else "false"
     )
 
+    paste_media_links_value = (
+        "true"
+        if paste_media_links
+        else "false"
+    )
+
     editor.web.eval(
         "window.removeSpacesPasteEnabled = "
         f"{remove_spaces_value};"
@@ -360,6 +875,11 @@ def update_editor(editor: Editor):
     editor.web.eval(
         "window.pasteAsPlainTextEnabled = "
         f"{plain_text_value};"
+    )
+
+    editor.web.eval(
+        "window.pasteMediaLinksEnabled = "
+        f"{paste_media_links_value};"
     )
 
 
@@ -381,9 +901,11 @@ class ClipboardControls(QDialog):
             "Clipboard Controls"
         )
 
-        self.setMinimumWidth(360)
+        self.setMinimumWidth(380)
 
         layout = QVBoxLayout()
+
+        current_settings = load_settings()
 
 
         # ----------------------------------------------------
@@ -391,10 +913,8 @@ class ClipboardControls(QDialog):
         # ----------------------------------------------------
 
         self.remove_spaces_checkbox = QCheckBox(
-            "Remove spaces"
+            "Remove spaces when pasting"
         )
-
-        current_settings = load_settings()
 
         self.remove_spaces_checkbox.setChecked(
             bool(
@@ -433,6 +953,28 @@ class ClipboardControls(QDialog):
 
 
         # ----------------------------------------------------
+        # Paste media links
+        # ----------------------------------------------------
+
+        self.paste_media_links_checkbox = QCheckBox(
+            "Paste image/audio links as media"
+        )
+
+        self.paste_media_links_checkbox.setChecked(
+            bool(
+                current_settings.get(
+                    "paste_media_links",
+                    False,
+                )
+            )
+        )
+
+        layout.addWidget(
+            self.paste_media_links_checkbox
+        )
+
+
+        # ----------------------------------------------------
         # Buttons
         # ----------------------------------------------------
 
@@ -462,10 +1004,14 @@ class ClipboardControls(QDialog):
     def save(self):
         global remove_spaces
         global paste_as_plain_text
+        global paste_media_links
         global settings
 
 
-        # Read checkbox values.
+        # ----------------------------------------------------
+        # Read settings.
+        # ----------------------------------------------------
+
         remove_spaces = (
             self.remove_spaces_checkbox.isChecked()
         )
@@ -474,24 +1020,41 @@ class ClipboardControls(QDialog):
             self.plain_text_checkbox.isChecked()
         )
 
+        paste_media_links = (
+            self.paste_media_links_checkbox.isChecked()
+        )
 
-        # Update settings.
-        settings["version"] = CURRENT_CONFIG_VERSION
 
-        settings["remove_spaces"] = remove_spaces
+        # ----------------------------------------------------
+        # Save settings.
+        # ----------------------------------------------------
+
+        settings["version"] = (
+            CURRENT_CONFIG_VERSION
+        )
+
+        settings["remove_spaces"] = (
+            remove_spaces
+        )
 
         settings["paste_as_plain_text"] = (
             paste_as_plain_text
         )
 
+        settings["paste_media_links"] = (
+            paste_media_links
+        )
 
-        # Save settings.
+
         save_settings(
             settings
         )
 
 
-        # Update currently-open editors.
+        # ----------------------------------------------------
+        # Update existing editors.
+        # ----------------------------------------------------
+
         for editor in editors:
 
             try:

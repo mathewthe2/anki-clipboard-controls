@@ -1,5 +1,6 @@
 {
     "version": "0.1",
-    "remove_spaces": false,
-    "paste_as_plain_text": true
+    "remove_spaces": true,
+    "paste_as_plain_text": true,
+    "paste_media_links": true
 }
