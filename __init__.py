@@ -1,3 +1,4 @@
+from .__version__ import __version__
 import json
 import os
 import re
@@ -21,10 +22,8 @@ from aqt.qt import (
 # Configuration
 # ============================================================
 
-CURRENT_CONFIG_VERSION = "0.1"
-
 DEFAULT_SETTINGS = {
-    "version": CURRENT_CONFIG_VERSION,
+    "version": __version__,
     "remove_spaces": False,
     "paste_as_plain_text": False,
     "paste_media_links": True,
@@ -113,7 +112,7 @@ def load_settings():
     changed = False
 
     if "version" not in settings:
-        settings["version"] = CURRENT_CONFIG_VERSION
+        settings["version"] = __version__
         changed = True
 
     # --------------------------------------------------------
@@ -145,8 +144,8 @@ def load_settings():
         settings["paste_media_links"] = False
         changed = True
 
-    if settings["version"] != CURRENT_CONFIG_VERSION:
-        settings["version"] = CURRENT_CONFIG_VERSION
+    if settings["version"] != __version__:
+        settings["version"] = __version__
         changed = True
 
     if changed:
@@ -164,7 +163,7 @@ def save_settings(settings):
 
     path = get_settings_path()
 
-    settings["version"] = CURRENT_CONFIG_VERSION
+    settings["version"] = __version__
 
     # Never save the old setting name.
     settings.pop(
@@ -1030,7 +1029,7 @@ class ClipboardControls(QDialog):
         # ----------------------------------------------------
 
         settings["version"] = (
-            CURRENT_CONFIG_VERSION
+            __version__
         )
 
         settings["remove_spaces"] = (
