@@ -1,0 +1,40 @@
+
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '_version.py'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get version from _version.py
+        id: version
+        run: |
+          VERSION=$(python3 -c "exec(open('_version.py').read()); print(__version__)")
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Bundle
+        run: |
+          zip -r ClipboardControls.zip . \
+            -x ".*" \
+            -x "__pycache__/*" \
+            -x README.md \
+            -x "**/__pycache__/*" \
+            -x ".github/*"
+
+      - name: Create tag and GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.VERSION }}
+          name: v${{ steps.version.outputs.VERSION }}
+          files: ClipboardControls.zip
+          generate_release_notes: true
